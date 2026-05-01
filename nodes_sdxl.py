@@ -166,7 +166,7 @@ class TIDESDXLHighRes:
                 "model": ("MODEL",),
                 "width": ("INT", {"default": 1536, "min": 64, "max": 16384, "step": 8}),
                 "height": ("INT", {"default": 1536, "min": 64, "max": 16384, "step": 8}),
-                "temperature_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "temperature_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "base_width": ("INT", {"default": 1024, "min": 64, "max": 16384, "step": 8}),
                 "base_height": ("INT", {"default": 1024, "min": 64, "max": 16384, "step": 8}),
                 "alpha": ("FLOAT", {"default": 0.6, "min": 0.01, "max": 4.0, "step": 0.05}),
@@ -203,7 +203,7 @@ class TIDESDXLHighRes:
             apply_to=str(apply_to),
         )
 
-        transformer_options = patched.model_options.setdefault("transformer_options", {})
+        transformer_options = patched.model_options.get("transformer_options", {}).copy()
         previous_override = transformer_options.get("optimized_attention_override", None)
         transformer_options["optimized_attention_override"] = build_sdxl_attention_override(config, previous_override)
         transformer_options["tide_sdxl"] = {
@@ -216,6 +216,7 @@ class TIDESDXLHighRes:
             "tau_max": config.tau_max,
             "apply_to": config.apply_to,
         }
+        patched.model_options["transformer_options"] = transformer_options
         return (patched,)
 
 
