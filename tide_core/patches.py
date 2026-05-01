@@ -194,7 +194,10 @@ class TIDEAttentionOverride:
         if mask is None:
             mask = kwargs.get("attn_mask", None)
         if self.config.force_pytorch_attention_with_mask and mask is not None:
-            return _sdpa_attention(*args, **kwargs)
+            sdpa_kwargs = dict(kwargs)
+            if "mask" not in sdpa_kwargs and "attn_mask" in sdpa_kwargs:
+                sdpa_kwargs["mask"] = sdpa_kwargs["attn_mask"]
+            return _sdpa_attention(*args, **sdpa_kwargs)
         if self.old_override is not None:
             return self.old_override(original_func, *args, **kwargs)
         return original_func(*args, **kwargs)

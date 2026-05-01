@@ -33,6 +33,16 @@ class TIDEConfig:
     preserve_existing_wrapper: bool = True
     debug: bool = False
 
+    def __post_init__(self) -> None:
+        for name in ("width", "height", "base_width", "base_height", "token_px"):
+            value = getattr(self, name)
+            try:
+                numeric_value = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be a positive integer-like value, got {value!r}") from exc
+            if numeric_value <= 0:
+                raise ValueError(f"{name} must be > 0, got {value!r}")
+
     @property
     def target_image_tokens(self) -> int:
         return max(1, (int(self.width) // self.token_px) * (int(self.height) // self.token_px))

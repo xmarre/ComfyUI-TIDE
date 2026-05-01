@@ -4,7 +4,13 @@ from typing import Any
 
 try:
     from .tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name not in {f"{__package__}.tide_core", "tide_core"}:
+        raise
+    from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper
+except ImportError as exc:
+    if "attempted relative import with no known parent package" not in str(exc):
+        raise
     from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper
 
 
