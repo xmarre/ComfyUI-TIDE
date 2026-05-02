@@ -1,3 +1,20 @@
+[project]
+name = "tide"
+description = "A ComfyUI custom node implementing TIDE (Text-Informed Dynamic Extrapolation with Step-Aware Temperature Control) for diffusion models."
+version = "1.0.0"
+license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/xmarre/ComfyUI-TIDE"
+Documentation = "https://github.com/xmarre/ComfyUI-TIDE/wiki"
+"Bug Tracker" = "https://github.com/xmarre/ComfyUI-TIDE/issues"
+
+[tool.comfy]
+PublisherId = "xmarre"
+DisplayName = "ComfyUI-TIDE"
+Icon = ""
+includes = []
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
