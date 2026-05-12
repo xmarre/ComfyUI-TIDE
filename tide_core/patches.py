@@ -97,7 +97,7 @@ class TIDEAttentionPatch:
                 try:
                     text_tokens = int(img_slice[0])
                     total_tokens = int(k.shape[2])
-                except Exception:
+                except (TypeError, ValueError, IndexError, AttributeError):
                     text_tokens = 0
                     total_tokens = 0
 
