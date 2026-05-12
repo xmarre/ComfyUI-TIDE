@@ -6,6 +6,7 @@ from .math import (
     rope_temperature_scale,
 )
 from .patches import TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper
+from .wan import TIDEWanDiffusionWrapper, install_tide_wan_patch
 
 __all__ = [
     "TIDEConfig",
@@ -16,4 +17,6 @@ __all__ = [
     "TIDEAttentionOverride",
     "TIDEAttentionPatch",
     "TIDEModelWrapper",
+    "TIDEWanDiffusionWrapper",
+    "install_tide_wan_patch",
 ]

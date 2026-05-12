@@ -2,7 +2,7 @@
 
 ComfyUI-TIDE is a ComfyUI custom node implementation of inference-time mechanisms from **TIDE: Text-Informed Dynamic Extrapolation with Step-Aware Temperature Control for Diffusion Transformers**.
 
-The primary implementation targets Flux-style DiT attention in ComfyUI. The repository also includes an experimental SDXL/UNet adaptation that applies the usable attention-temperature part of the method to SDXL-style `SpatialTransformer` attention.
+The primary implementation targets Flux-style DiT attention in ComfyUI. The repository also includes a WAN 2.1/2.2 path for ComfyUI WAN video DiTs and an experimental SDXL/UNet adaptation that applies the usable attention-temperature part of the method to SDXL-style `SpatialTransformer` attention.
 
 The nodes patch a cloned ComfyUI `MODEL` object. They do **not** add extra sampling steps, replace the sampler, replace the scheduler, or fork ComfyUI core.
 
@@ -42,6 +42,12 @@ For Flux-style joint text/image attention, it implements:
 * a lightweight ComfyUI model wrapper to pass the current denoising timestep into the attention patch;
 * a small PyTorch SDPA fallback used only when an additive TIDE attention mask is active.
 
+For WAN 2.1/2.2-style video DiT attention, it implements:
+
+* step-aware RoPE temperature scaling for WAN self-attention;
+* lazy wrapping of ComfyUI WAN `rope_encode` / `forward_orig` paths through a cloned-model diffusion wrapper;
+* chaining through ComfyUI `WrappersMP.DIFFUSION_MODEL` without modifying ComfyUI core.
+
 For SDXL-style UNet attention, it implements:
 
 * step-aware attention-temperature scaling through ComfyUI's `optimized_attention_override`;
@@ -63,6 +69,17 @@ The main target path is FLUX-family DiT models in ComfyUI, including FLUX.2-styl
 * RoPE matrix passed as `pe`.
 
 Other DiT models may require model-specific patch paths. They should not be assumed to work unless their ComfyUI implementation exposes the same attention-patch contract.
+
+### WAN 2.1 / 2.2 video DiT path
+
+The WAN node targets ComfyUI WAN-family implementations based on `comfy.ldm.wan.model.WanModel` and close subclasses, including WAN 2.1 and WAN 2.2 paths that expose:
+
+* `rope_encode`;
+* `forward_orig`;
+* `rope_embedder.axes_dim`;
+* ComfyUI diffusion-model wrapper execution.
+
+The WAN path applies Dynamic Temperature Control to the WAN self-attention RoPE matrices. It does **not** apply TIDE Text Anchoring because ComfyUI WAN uses separate self-attention over video tokens and cross-attention over text/context tokens. In that architecture, text keys and image/video keys are not competing inside one joint softmax, and adding the same positive bias to every text key in pure cross-attention would be cancelled by softmax shift invariance.
 
 ### SDXL / UNet path
 
@@ -87,6 +104,18 @@ Implemented mechanisms:
 * Text Anchoring;
 * Dynamic Temperature Control;
 * optional PyTorch SDPA fallback when the additive text-anchor mask is active.
+
+### TIDE WAN High-Resolution Extrapolation
+
+Use this node for WAN 2.1 / WAN 2.2-style video DiT models in ComfyUI.
+
+Implemented mechanism:
+
+* Dynamic Temperature Control on WAN self-attention RoPE.
+
+Not implemented for WAN:
+
+* Text Anchoring, because WAN text conditioning is separate cross-attention rather than Flux-style joint text/image attention.
 
 ### TIDE SDXL High-Resolution Extrapolation
 
@@ -151,7 +180,13 @@ Defaults:
 
 `frequency_mode=official_raw` uses raw RoPE frequencies, matching the released implementation behavior this port was written against. `paper_normalized` is exposed for comparison because the paper notation describes a normalized frequency variable.
 
-### 3. Dynamic attention temperature for SDXL/UNet attention
+### 3. Dynamic Temperature Control for WAN 2.1/2.2 RoPE attention
+
+The WAN node applies the same step-aware RoPE temperature multiplier used by the Flux path, but at ComfyUI WAN's `rope_encode` / `forward_orig` boundary. WAN uses a three-axis RoPE layout `(time, height, width)`, discovered from `rope_embedder.axes_dim` at runtime. Spatial scaling uses the node's `width`, `height`, `base_width`, and `base_height`; the temporal axis is left unscaled.
+
+Because WAN does not expose a Flux-style joint text/image attention softmax, the WAN node sets `text_anchor_strength=0.0` internally and only applies Dynamic Temperature Control.
+
+### 4. Dynamic attention temperature for SDXL/UNet attention
 
 The SDXL node applies the attention-temperature part of the method by scaling the attention query tensor before ComfyUI's optimized attention function:
 
@@ -206,6 +241,15 @@ SDXL defaults:
 6. No global monkey-patching is used.
 7. No sampler or scheduler rewrite is performed.
 
+### WAN path
+
+1. The WAN node clones and patches the incoming ComfyUI `MODEL`.
+2. It installs a ComfyUI `WrappersMP.DIFFUSION_MODEL` wrapper on the cloned model.
+3. The wrapper injects current timestep metadata into `transformer_options["tide"]`.
+4. The wrapper lazily wraps the live WAN model's `rope_encode` and `forward_orig` methods.
+5. `rope_encode` output or externally supplied `freqs` are multiplied by the TIDE per-frequency temperature scale once per forward path.
+6. The implementation preserves ComfyUI's native WAN block loop, sampler, scheduler, attention backend, and dynamic-VRAM lifetime.
+
 ### SDXL path
 
 1. The SDXL node clones and patches the incoming ComfyUI `MODEL`.
@@ -229,6 +273,7 @@ SDXL defaults:
 | Dynamic Temperature Control                         | `dyheating()` / temperature-aware RoPE scaling                      | `tide_core.math.rope_temperature_scale`, applied to ComfyUI `pe`                                                           |
 | Denoising-step-aware behavior                       | Update position embedding state from current timestep               | `TIDEModelWrapper` injects normalized timestep into `transformer_options`                                                  |
 | FLUX attention integration                          | Modified Diffusers FLUX transformer/processor                       | ComfyUI `attn1_patch` plus optional `optimized_attention_override`                                                         |
+| WAN attention integration                           | Not part of the paper's main Flux/MM-DiT implementation             | `tide_core.wan`, ComfyUI diffusion-model wrapper, RoPE scaling for WAN self-attention                                      |
 | SDXL attention integration                          | Not part of the paper's main Flux/MM-DiT implementation             | `nodes_sdxl.py`, ComfyUI `optimized_attention_override`, query scaling for UNet attention                                  |
 | Logarithmic FLUX scheduler shift                    | Scheduler/pipeline-level change                                     | Not implemented by this node                                                                                               |
 | DyPE / NTK-by-parts / YaRN positional interpolation | Custom positional interpolation stack                               | Not fully implemented; this node implements the TIDE attention-side mechanisms only                                        |
@@ -277,6 +322,34 @@ Ablation settings:
 | Text Anchoring only      | `text_anchor_strength=1.0`, `temperature_strength=0.0` |
 | Dynamic Temperature only | `text_anchor_strength=0.0`, `temperature_strength=1.0` |
 | Disabled                 | `text_anchor_strength=0.0`, `temperature_strength=0.0` |
+
+### WAN 2.1 / 2.2 usage
+
+1. Load a WAN 2.1 or WAN 2.2 model as usual.
+2. Add **TIDE WAN High-Resolution Extrapolation** after the model loader.
+3. Connect the patched `model` output to your sampler.
+4. Set `width` and `height` to the final video frame dimensions in pixels.
+5. Set `base_width` and `base_height` to the resolution you want to treat as the model's native/reference resolution for this workflow. The node defaults to `640x640` because ComfyUI's WAN 2.2 text-to-video blueprint currently uses that size, but WAN checkpoints and workflows vary.
+
+Recommended starting values:
+
+| Setting                      |                        Value |
+| ---------------------------- | ---------------------------: |
+| `width` / `height`           | final video frame dimensions |
+| `base_width` / `base_height` | workflow/model reference |
+| `temperature_strength`       |                        `1.0` |
+| `alpha_low`                  |                        `0.6` |
+| `alpha_high`                 |                        `0.2` |
+| `tau_max`                    |                        `1.0` |
+| `frequency_mode`             |               `official_raw` |
+
+WAN ablation settings:
+
+| Test                    | Settings                         |
+| ----------------------- | -------------------------------- |
+| Dynamic Temperature     | `temperature_strength=1.0`       |
+| Disabled                | `temperature_strength=0.0`       |
+| Force native-size patch | `apply_to_native_or_smaller=True` |
 
 ### SDXL usage
 
@@ -335,6 +408,21 @@ SDXL ablation settings:
 | `preserve_existing_wrapper`         |         `True` | Delegate to an existing ComfyUI model wrapper after injecting TIDE metadata. |
 | `debug`                             |        `False` | Log skipped DTC shape mismatches and exceptions.                             |
 
+### TIDE WAN High-Resolution Extrapolation
+
+| Input                        |        Default | Description                                                                                          |
+| ---------------------------- | -------------: | ---------------------------------------------------------------------------------------------------- |
+| `model`                      |       required | ComfyUI `MODEL` object to patch.                                                                     |
+| `width`, `height`            | `1280`, `720`  | Final target video frame dimensions in pixels. Must match the latent/video size used by the workflow. |
+| `temperature_strength`       |          `1.0` | Strength of WAN RoPE Dynamic Temperature Control. `0.0` disables the WAN patch.                       |
+| `base_width`, `base_height`  |   `640`, `640` | Reference/native resolution used for adaptive scaling. Adjust for the checkpoint/workflow.            |
+| `alpha_low`, `alpha_high`    |   `0.6`, `0.2` | DTC exponents for low/high RoPE frequency behavior.                                                   |
+| `tau_max`                    |          `1.0` | Maximum temperature reached near the end of denoising.                                                |
+| `frequency_mode`             | `official_raw` | `official_raw` or `paper_normalized`.                                                                 |
+| `apply_to_native_or_smaller` |        `False` | Allow patching even when target token count is not above base token count.                            |
+| `preserve_existing_wrapper`  |         `True` | Delegate to an existing ComfyUI model wrapper after injecting TIDE metadata.                          |
+| `debug`                      |        `False` | Log skipped WAN wrapping/shape cases.                                                                 |
+
 ### TIDE SDXL High-Resolution Extrapolation
 
 | Input                       |        Default | Description                                                                                          |
@@ -362,10 +450,12 @@ ComfyUI-TIDE/
 │   ├── __init__.py
 │   ├── config.py
 │   ├── math.py
-│   └── patches.py
+│   ├── patches.py
+│   └── wan.py
 └── tests/
     ├── test_attention_patch.py
-    └── test_math.py
+    ├── test_math.py
+    └── test_wan.py
 ```
 
 ## Tests
@@ -383,7 +473,8 @@ The tests cover:
 * YaRN/default temperature formula;
 * RoPE temperature scale shape and timestep progression;
 * additive attention-mask creation;
-* masked SDPA override behavior.
+* masked SDPA override behavior;
+* WAN RoPE temperature scaling helper behavior.
 
 The tests do not validate visual quality or live ComfyUI execution.
 
@@ -394,6 +485,10 @@ python -m py_compile nodes_sdxl.py
 ```
 
 ## Paper vs implementation differences
+
+### WAN support is an adaptation, not full Flux/MM-DiT TIDE
+
+The full Text Anchoring mechanism is defined for MM-DiT joint attention where text keys and image keys compete inside one softmax. ComfyUI WAN uses self-attention for video/image tokens and separate cross-attention for text/context tokens. Therefore this repository applies the TIDE Dynamic Temperature Control mechanism to WAN self-attention RoPE, but does not apply Text Anchoring to WAN cross-attention.
 
 ### SDXL support is an adaptation, not full TIDE
 
@@ -432,6 +527,15 @@ The method is architecture-relevant to DiTs, but this implementation is tied to 
 * The timestep passed through the model wrapper is normalized or sigma-like in `[0, 1]`; values outside the interval are clamped.
 * FLUX-family image token granularity is 16 pixels per transformer token.
 
+### WAN path
+
+* The model uses a ComfyUI WAN implementation with `rope_encode` and `forward_orig`.
+* The node `width` and `height` match the actual generated video frame dimensions.
+* `base_width` and `base_height` are chosen as the intended native/reference dimensions for the specific WAN checkpoint/workflow.
+* WAN RoPE axes are ordered as `(time, height, width)`, matching ComfyUI's `WanModel.rope_encode`.
+* The temporal RoPE axis is not scaled by this node.
+* The timestep passed through the model wrapper is normalized or sigma-like in `[0, 1]`; values outside the interval are clamped.
+
 ### SDXL path
 
 * The model uses ComfyUI's UNet `SpatialTransformer` attention path.
@@ -449,6 +553,8 @@ The method is architecture-relevant to DiTs, but this implementation is tied to 
 * Does not modify the sampler's high-resolution time-shift schedule.
 * Does not fully implement NTK-by-parts, YaRN positional interpolation, or DyPE positional interpolation.
 * Flux support is tied to ComfyUI's Flux-style attention patch contract.
+* WAN support applies Dynamic Temperature Control only; WAN Text Anchoring is intentionally not implemented.
+* WAN visual quality needs live workflow testing across WAN 2.1/2.2 variants, frame counts, resolutions, samplers, and attention backends.
 * SDXL support is an experimental attention-temperature adaptation, not full Text Anchoring.
 * SDXL visual quality needs live workflow testing across checkpoints, resolutions, samplers, and attention backends.
 * Very large resolutions still require sufficient VRAM for the selected model, sampler, attention path, latent size, and VAE path.
