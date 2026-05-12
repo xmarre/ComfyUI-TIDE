@@ -76,7 +76,15 @@ class TIDEAttentionPatch:
     def to(self, device: torch.device | str):  # Comfy calls .to on patches during model moves.
         return self
 
-    def __call__(self, q, k, v, pe=None, attn_mask=None, extra_options=None):
+    def __call__(self, q, k=None, v=None, pe=None, attn_mask=None, extra_options=None):
+        # ComfyUI WAN currently calls attn1_patch after self-attention with a
+        # single dict payload: {"x", "q", "k", "transformer_options"}.
+        # The Flux TIDE patch cannot modify that already-computed attention, so
+        # leave it as a no-op instead of failing when the generic node is used
+        # on a WAN model. WAN support is installed through tide_core.wan.
+        if k is None and v is None and isinstance(q, dict) and {"x", "q", "k", "transformer_options"}.issubset(q):
+            return q.get("x", q)
+
         extra_options = extra_options or {}
         if not self.config.should_apply() or not _block_enabled(self.config, extra_options):
             return {"q": q, "k": k, "v": v, "pe": pe, "attn_mask": attn_mask}

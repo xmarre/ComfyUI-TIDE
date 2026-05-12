@@ -3,15 +3,15 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from .tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper
+    from .tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper, install_tide_wan_patch
 except ModuleNotFoundError as exc:
     if exc.name not in {f"{__package__}.tide_core", "tide_core"}:
         raise
-    from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper
+    from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper, install_tide_wan_patch
 except ImportError as exc:
     if "attempted relative import with no known parent package" not in str(exc):
         raise
-    from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper
+    from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper, install_tide_wan_patch
 
 
 class TIDEHighResolutionExtrapolation:
@@ -110,10 +110,89 @@ class TIDEHighResolutionExtrapolation:
         return (patched,)
 
 
+class TIDEWANHighResolutionExtrapolation:
+    """Patch a WAN 2.1/2.2-style DiT model with TIDE Dynamic Temperature Control."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "width": ("INT", {"default": 1280, "min": 16, "max": 16384, "step": 16}),
+                "height": ("INT", {"default": 720, "min": 16, "max": 16384, "step": 16}),
+                "temperature_strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05, "tooltip": "0 disables WAN Dynamic Temperature Control; 1.0 uses the TIDE/YaRN curve."},
+                ),
+            },
+            "optional": {
+                "base_width": ("INT", {"default": 640, "min": 16, "max": 16384, "step": 16}),
+                "base_height": ("INT", {"default": 640, "min": 16, "max": 16384, "step": 16}),
+                "alpha_low": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 8.0, "step": 0.05}),
+                "alpha_high": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 8.0, "step": 0.05}),
+                "tau_max": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 4.0, "step": 0.01}),
+                "frequency_mode": (["official_raw", "paper_normalized"], {"default": "official_raw"}),
+                "apply_to_native_or_smaller": ("BOOLEAN", {"default": False}),
+                "preserve_existing_wrapper": ("BOOLEAN", {"default": True}),
+                "debug": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/TIDE"
+
+    def patch(
+        self,
+        model,
+        width: int,
+        height: int,
+        temperature_strength: float,
+        base_width: int = 640,
+        base_height: int = 640,
+        alpha_low: float = 0.6,
+        alpha_high: float = 0.2,
+        tau_max: float = 1.0,
+        frequency_mode: str = "official_raw",
+        apply_to_native_or_smaller: bool = False,
+        preserve_existing_wrapper: bool = True,
+        debug: bool = False,
+    ):
+        config = TIDEConfig(
+            width=int(width),
+            height=int(height),
+            base_width=int(base_width),
+            base_height=int(base_height),
+            text_anchor_strength=0.0,
+            temperature_strength=float(temperature_strength),
+            alpha_low=float(alpha_low),
+            alpha_high=float(alpha_high),
+            tau_max=float(tau_max),
+            frequency_mode=str(frequency_mode),
+            apply_to_double_blocks=True,
+            apply_to_single_blocks=False,
+            apply_to_native_or_smaller=bool(apply_to_native_or_smaller),
+            force_pytorch_attention_with_mask=False,
+            preserve_existing_wrapper=bool(preserve_existing_wrapper),
+            debug=bool(debug),
+        )
+
+        patched = model.clone()
+
+        old_wrapper = patched.model_options.get("model_function_wrapper")
+        patched.set_model_unet_function_wrapper(TIDEModelWrapper(config, old_wrapper=old_wrapper))
+        install_tide_wan_patch(patched, config)
+
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
     "TIDEHighResolutionExtrapolation": TIDEHighResolutionExtrapolation,
+    "TIDEWANHighResolutionExtrapolation": TIDEWANHighResolutionExtrapolation,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TIDEHighResolutionExtrapolation": "TIDE High-Resolution Extrapolation",
+    "TIDEWANHighResolutionExtrapolation": "TIDE WAN High-Resolution Extrapolation",
 }
