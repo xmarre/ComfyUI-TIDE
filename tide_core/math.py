@@ -34,7 +34,7 @@ def adaptive_text_bias(config: TIDEConfig) -> float:
     paper value linearly; values <= base resolution return zero by default.
     """
 
-    if not config.should_apply():
+    if not config.should_apply_text_anchor():
         return 0.0
     beta = math.log(config.target_pixel_ratio)
     if beta < 0.0 and not config.apply_to_native_or_smaller:

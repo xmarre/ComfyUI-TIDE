@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import asdict, replace
 from typing import Any, Optional
 
@@ -17,6 +18,12 @@ _ENABLED_KEY = "tide_wan_enabled"
 _WRAPPER_KEY = "tide_wan_rope_temperature"
 _SCALED_FREQS_ID_KEY = "_tide_wan_scaled_freqs_id"
 _DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
+_DEBUG_SCALE_LOG_LIMIT = 12
+
+
+def _debug_print(config: Optional[TIDEConfig], message: str) -> None:
+    if config is not None and config.debug:
+        print(message, file=sys.stderr, flush=True)
 
 try:  # pragma: no cover - ComfyUI is not importable in standalone tests.
     import comfy.patcher_extension as _comfy_patcher_extension
@@ -93,7 +100,20 @@ def _scale_wan_freqs(
 
     if not torch.is_tensor(freqs):
         return freqs
-    if config.temperature_strength == 0.0 or not config.should_apply():
+    if config.temperature_strength == 0.0:
+        if config.debug:
+            _debug_print(config, "[ComfyUI-TIDE] WAN DTC disabled: temperature_strength=0")
+        return freqs
+    if not config.should_apply_temperature():
+        if config.debug:
+            _debug_print(
+                config,
+                "[ComfyUI-TIDE] WAN DTC inactive: "
+                f"width={config.width} height={config.height} "
+                f"base={config.base_width}x{config.base_height} "
+                f"scale_x={config.scale_x:.4f} scale_y={config.scale_y:.4f} "
+                "and apply_to_native_or_smaller=false",
+            )
         return freqs
 
     axes_dim = _read_wan_axes_dim(inner, tuple(config.axes_dim))
@@ -118,10 +138,31 @@ def _scale_wan_freqs(
                 freqs.shape[-3] if freqs.ndim >= 3 else None,
                 scale.numel(),
             )
+            _debug_print(
+                config,
+                "[ComfyUI-TIDE] WAN DTC skipped: "
+                f"freqs_shape={tuple(freqs.shape)} scale_len={int(scale.numel())}",
+            )
         return freqs
 
     view_shape = (1,) * (freqs.ndim - 3) + (scale.numel(), 1, 1)
-    return freqs * scale.reshape(view_shape)
+    out = freqs * scale.reshape(view_shape)
+
+    if config.debug:
+        count = int(getattr(inner, "_tide_wan_scale_log_count", 0))
+        if count < _DEBUG_SCALE_LOG_LIMIT:
+            setattr(inner, "_tide_wan_scale_log_count", count + 1)
+            _debug_print(
+                config,
+                "[ComfyUI-TIDE] WAN DTC applied: "
+                f"step_log={count + 1}/{_DEBUG_SCALE_LOG_LIMIT} "
+                f"timestep={float(timestep):.6f} "
+                f"shape={tuple(freqs.shape)} axes_dim={axes_dim} "
+                f"scale_x={config.scale_x:.4f} scale_y={config.scale_y:.4f} "
+                f"scale_min={float(scale.min().detach().cpu()):.6f} "
+                f"scale_max={float(scale.max().detach().cpu()):.6f}",
+            )
+    return out
 
 
 def _mark_scaled_freqs(transformer_options: Optional[dict[str, Any]], freqs: Any) -> None:
@@ -175,6 +216,7 @@ def _ensure_wan_rope_encode_wrapped(inner: Any, fallback_config: Optional[TIDECo
     inner._tide_wan_original_rope_encode = original_rope_encode
     inner.rope_encode = tide_wan_rope_encode
     inner._tide_wan_rope_encode_wrapped = True
+    _debug_print(fallback_config, f"[ComfyUI-TIDE] WAN wrapped rope_encode on {type(inner).__name__} id={id(inner)}")
     return True
 
 
@@ -216,6 +258,7 @@ def _ensure_wan_forward_orig_wrapped(inner: Any, fallback_config: Optional[TIDEC
     inner._tide_wan_original_forward_orig = original_forward_orig
     inner.forward_orig = tide_wan_forward_orig
     inner._tide_wan_forward_orig_wrapped = True
+    _debug_print(fallback_config, f"[ComfyUI-TIDE] WAN wrapped forward_orig on {type(inner).__name__} id={id(inner)}")
     return True
 
 
@@ -242,7 +285,7 @@ class TIDEWanDiffusionWrapper:
         if transformer_options is None:
             transformer_options = {}
         transformer_options[_CONFIG_KEY] = self.config
-        transformer_options[_ENABLED_KEY] = self.config.should_apply() and self.config.temperature_strength != 0.0
+        transformer_options[_ENABLED_KEY] = self.config.should_apply_temperature() and self.config.temperature_strength != 0.0
 
         tide_opts = transformer_options.get("tide", {})
         if not isinstance(tide_opts, dict):
@@ -255,8 +298,19 @@ class TIDEWanDiffusionWrapper:
         inner = getattr(executor, "class_obj", None)
         wrapped_rope = _ensure_wan_rope_encode_wrapped(inner, self.config)
         wrapped_forward_orig = _ensure_wan_forward_orig_wrapped(inner, self.config)
-        if self.config.debug and not (wrapped_rope or wrapped_forward_orig):
-            _LOG.warning("TIDE WAN wrapper did not find a WAN-like rope_encode/forward_orig target on %s", type(inner).__name__ if inner is not None else None)
+        if self.config.debug:
+            if not getattr(self, "_logged_runtime", False):
+                _debug_print(
+                    self.config,
+                    "[ComfyUI-TIDE] WAN diffusion wrapper active: "
+                    f"inner={type(inner).__name__ if inner is not None else None} "
+                    f"wrapped_rope={bool(wrapped_rope)} wrapped_forward_orig={bool(wrapped_forward_orig)} "
+                    f"enabled={bool(transformer_options[_ENABLED_KEY])}",
+                )
+                self._logged_runtime = True
+            if not (wrapped_rope or wrapped_forward_orig):
+                _LOG.warning("TIDE WAN wrapper did not find a WAN-like rope_encode/forward_orig target on %s", type(inner).__name__ if inner is not None else None)
+                _debug_print(self.config, f"[ComfyUI-TIDE] WAN wrapper did not find WAN target: inner={type(inner).__name__ if inner is not None else None}")
 
         return executor(
             x,
@@ -274,7 +328,7 @@ def install_tide_wan_patch(model: Any, config: TIDEConfig) -> Any:
 
     transformer_options = _ensure_transformer_options(model)
     transformer_options[_CONFIG_KEY] = config
-    transformer_options[_ENABLED_KEY] = config.should_apply() and config.temperature_strength != 0.0
+    transformer_options[_ENABLED_KEY] = config.should_apply_temperature() and config.temperature_strength != 0.0
     transformer_options["tide_wan"] = _config_dict(config)
 
     wrapper = TIDEWanDiffusionWrapper(config)
@@ -290,6 +344,16 @@ def install_tide_wan_patch(model: Any, config: TIDEConfig) -> Any:
         wrappers = transformer_options.setdefault("wrappers", {})
         wrappers_for_type = wrappers.setdefault(wrapper_type, {})
         wrappers_for_type[_WRAPPER_KEY] = [wrapper]
+
+    _debug_print(
+        config,
+        "[ComfyUI-TIDE] WAN patch installed: "
+        f"wrapper_type={wrapper_type} model_patcher_wrapper={installed_on_patcher} "
+        f"enabled={bool(transformer_options[_ENABLED_KEY])} "
+        f"width={config.width} height={config.height} base={config.base_width}x{config.base_height} "
+        f"scale_x={config.scale_x:.4f} scale_y={config.scale_y:.4f} "
+        f"temperature_strength={config.temperature_strength:.4f}",
+    )
 
     # Best-effort eager wrapping for already-materialized WAN models. The runtime
     # diffusion wrapper repeats this lazily because ComfyUI can replace/live-wrap

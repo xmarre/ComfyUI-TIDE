@@ -86,36 +86,37 @@ class TIDEAttentionPatch:
             return q.get("x", q)
 
         extra_options = extra_options or {}
-        if not self.config.should_apply() or not _block_enabled(self.config, extra_options):
-            return {"q": q, "k": k, "v": v, "pe": pe, "attn_mask": attn_mask}
-
-        img_slice = extra_options.get("img_slice")
-        if not img_slice or len(img_slice) != 2:
-            return {"q": q, "k": k, "v": v, "pe": pe, "attn_mask": attn_mask}
-
-        try:
-            text_tokens = int(img_slice[0])
-            total_tokens = int(k.shape[2])
-        except Exception:
-            return {"q": q, "k": k, "v": v, "pe": pe, "attn_mask": attn_mask}
-
-        if text_tokens <= 0 or total_tokens <= text_tokens:
+        if not _block_enabled(self.config, extra_options):
             return {"q": q, "k": k, "v": v, "pe": pe, "attn_mask": attn_mask}
 
         out_mask = attn_mask
         beta = adaptive_text_bias(self.config)
         if beta != 0.0:
-            out_mask = _add_text_bias_mask(
-                attn_mask,
-                text_tokens=text_tokens,
-                key_tokens=total_tokens,
-                beta=beta,
-                device=k.device,
-                dtype=q.dtype if torch.is_floating_point(q) else torch.float32,
-            )
+            img_slice = extra_options.get("img_slice")
+            if img_slice and len(img_slice) == 2:
+                try:
+                    text_tokens = int(img_slice[0])
+                    total_tokens = int(k.shape[2])
+                except Exception:
+                    text_tokens = 0
+                    total_tokens = 0
+
+                if text_tokens > 0 and total_tokens > text_tokens:
+                    out_mask = _add_text_bias_mask(
+                        attn_mask,
+                        text_tokens=text_tokens,
+                        key_tokens=total_tokens,
+                        beta=beta,
+                        device=k.device,
+                        dtype=q.dtype if torch.is_floating_point(q) else torch.float32,
+                    )
+                elif self.config.debug:
+                    _LOG.warning("TIDE skipped text anchoring because Flux text/image token slices were unavailable.")
+            elif self.config.debug:
+                _LOG.warning("TIDE skipped text anchoring because Flux img_slice metadata was unavailable.")
 
         out_pe = pe
-        if pe is not None and self.config.temperature_strength != 0.0:
+        if pe is not None and self.config.temperature_strength != 0.0 and self.config.should_apply_temperature():
             tide_opts = extra_options.get("tide", {})
             timestep = _safe_timestep01(tide_opts.get("timestep", extra_options.get("timestep")))
             try:
