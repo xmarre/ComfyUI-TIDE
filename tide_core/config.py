@@ -67,5 +67,21 @@ class TIDEConfig:
     def is_extrapolating(self) -> bool:
         return self.target_image_tokens > self.base_image_tokens
 
-    def should_apply(self) -> bool:
+    @property
+    def is_axis_extrapolating(self) -> bool:
+        return self.scale_x > 1.0 or self.scale_y > 1.0
+
+    def should_apply_text_anchor(self) -> bool:
+        # Text anchoring is derived from total text/image token dilution, so keep
+        # the area-based gate unless the user explicitly forces native/smaller use.
         return self.apply_to_native_or_smaller or self.is_extrapolating
+
+    def should_apply_temperature(self) -> bool:
+        # Dynamic Temperature Control is RoPE-axis based. Wide or tall WAN/Flux
+        # generations can extrapolate on one spatial axis while total pixel count
+        # is <= the square base area, e.g. 832x480 vs 640x640. In that case the
+        # width axis still needs the DTC path.
+        return self.apply_to_native_or_smaller or self.is_axis_extrapolating
+
+    def should_apply(self) -> bool:
+        return self.should_apply_text_anchor() or self.should_apply_temperature()
