@@ -262,6 +262,30 @@ def _ensure_wan_forward_orig_wrapped(inner: Any, fallback_config: Optional[TIDEC
     return True
 
 
+def _resolve_apply_model_wan_inner(apply_model: Any) -> Any:
+    outer = getattr(apply_model, "__self__", None)
+    if outer is None:
+        return None
+
+    candidates = [
+        getattr(outer, "diffusion_model", None),
+    ]
+
+    model = getattr(outer, "model", None)
+    if model is not None:
+        candidates.extend(
+            [
+                getattr(model, "diffusion_model", None),
+                getattr(getattr(model, "model", None), "diffusion_model", None),
+            ]
+        )
+
+    for candidate in candidates:
+        if _looks_like_wan_inner(candidate):
+            return candidate
+    return None
+
+
 class TIDEWanDiffusionWrapper:
     """ComfyUI diffusion_model wrapper that enables WAN RoPE DTC hooks lazily."""
 
@@ -323,6 +347,53 @@ class TIDEWanDiffusionWrapper:
         )
 
 
+def prepare_tide_wan_apply_model(
+    apply_model: Any,
+    config: TIDEConfig,
+    transformer_options: Optional[dict[str, Any]],
+) -> None:
+    """Prepare WAN DTC before Comfy's APPLY_MODEL wrappers run.
+
+    Spectrum WAN 2.1 can drive the WAN model from an APPLY_MODEL wrapper and
+    return without entering Comfy's native DIFFUSION_MODEL wrapper chain.  The
+    normal TIDE WAN diffusion wrapper therefore cannot be the only lazy binding
+    point.  This hook runs from TIDE's model_function_wrapper, mutates the same
+    transformer_options dict the sampler will pass into apply_model, and wraps
+    the live WanModel before Spectrum's APPLY_MODEL wrapper can bypass the lower
+    wrapper chain.
+    """
+
+    if transformer_options is None:
+        return
+
+    outer = getattr(apply_model, "__self__", None)
+    inner = _resolve_apply_model_wan_inner(apply_model)
+    if not _looks_like_wan_inner(inner):
+        return
+
+    transformer_options[_CONFIG_KEY] = config
+    transformer_options[_ENABLED_KEY] = config.should_apply_temperature() and config.temperature_strength != 0.0
+
+    wrapped_rope = _ensure_wan_rope_encode_wrapped(inner, config)
+    wrapped_forward_orig = _ensure_wan_forward_orig_wrapped(inner, config)
+
+    if config.debug:
+        # Log once per live inner. This is intentionally separate from
+        # TIDEWanDiffusionWrapper's runtime log because Spectrum WAN 2.1 may
+        # bypass that path completely.
+        marker = "_tide_wan_apply_model_prepare_logged"
+        if not getattr(inner, marker, False):
+            setattr(inner, marker, True)
+            _debug_print(
+                config,
+                "[ComfyUI-TIDE] WAN apply_model prepare active: "
+                f"outer={type(outer).__name__ if outer is not None else None} "
+                f"inner={type(inner).__name__ if inner is not None else None} "
+                f"wrapped_rope={bool(wrapped_rope)} wrapped_forward_orig={bool(wrapped_forward_orig)} "
+                f"enabled={bool(transformer_options[_ENABLED_KEY])}",
+            )
+
+
 def install_tide_wan_patch(model: Any, config: TIDEConfig) -> Any:
     """Install the WAN-specific TIDE DTC path on a cloned ComfyUI MODEL."""
 
@@ -368,5 +439,6 @@ def install_tide_wan_patch(model: Any, config: TIDEConfig) -> Any:
 __all__ = [
     "TIDEWanDiffusionWrapper",
     "install_tide_wan_patch",
+    "prepare_tide_wan_apply_model",
     "_scale_wan_freqs",
 ]

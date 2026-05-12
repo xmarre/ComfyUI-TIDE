@@ -237,6 +237,19 @@ class TIDEModelWrapper:
         transformer_options["tide"] = tide_opts
         c["transformer_options"] = transformer_options
 
+        # WAN 2.1 Spectrum can complete from an APPLY_MODEL wrapper without
+        # entering the lower DIFFUSION_MODEL wrapper chain where TIDE WAN normally
+        # binds lazily.  If this is a WAN-looking model, bind the live inner here
+        # before apply_model runs.  The helper is intentionally best-effort and is
+        # a no-op for Flux/SDXL/non-WAN models.
+        try:
+            from .wan import prepare_tide_wan_apply_model
+
+            prepare_tide_wan_apply_model(apply_model, self.config, transformer_options)
+        except Exception as exc:
+            if self.config.debug:
+                _LOG.exception("TIDE WAN apply_model preparation failed and was skipped: %s", exc)
+
         if self.config.preserve_existing_wrapper and self.old_wrapper is not None:
             return self.old_wrapper(apply_model, args | {"c": c})
         return apply_model(args["input"], args["timestep"], **c)
