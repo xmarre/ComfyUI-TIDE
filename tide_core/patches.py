@@ -93,7 +93,12 @@ class TIDEAttentionPatch:
         beta = adaptive_text_bias(self.config)
         if beta != 0.0:
             img_slice = extra_options.get("img_slice")
-            if img_slice and len(img_slice) == 2:
+            try:
+                has_img_slice = img_slice is not None and len(img_slice) == 2
+            except TypeError:
+                has_img_slice = False
+
+            if has_img_slice:
                 try:
                     text_tokens = int(img_slice[0])
                     total_tokens = int(k.shape[2])
