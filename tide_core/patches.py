@@ -235,6 +235,21 @@ class TIDEModelWrapper:
         tide_opts["width"] = self.config.width
         tide_opts["height"] = self.config.height
         transformer_options["tide"] = tide_opts
+
+        # WAN 2.1/Spectrum may replace BaseModel.apply_model with a closure and
+        # may also bypass some lower wrapper paths.  Put the WAN TIDE config into
+        # the live transformer_options before any downstream wrapper sees them;
+        # this is skipped for Flux/SDXL because only install_tide_wan_patch marks
+        # model options with the WAN runtime contract.
+        try:
+            from .wan import has_tide_wan_options, inject_tide_wan_options
+
+            if has_tide_wan_options(transformer_options):
+                inject_tide_wan_options(transformer_options, self.config, timestep=args.get("timestep"), source="model_function_wrapper")
+        except Exception as exc:
+            if self.config.debug:
+                _LOG.exception("TIDE WAN transformer_options injection failed and was skipped: %s", exc)
+
         c["transformer_options"] = transformer_options
 
         # WAN 2.1 Spectrum can complete from an APPLY_MODEL wrapper without
