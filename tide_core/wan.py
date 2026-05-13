@@ -17,8 +17,11 @@ _CONFIG_KEY = "tide_wan_config"
 _ENABLED_KEY = "tide_wan_enabled"
 _WRAPPER_KEY = "tide_wan_rope_temperature"
 _SCALED_FREQS_ID_KEY = "_tide_wan_scaled_freqs_id"
+_CONFIG_SOURCE_KEY = "_tide_wan_config_source"
+_TRACE_LOG_COUNT_KEY = "_tide_wan_trace_log_count"
 _DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
 _DEBUG_SCALE_LOG_LIMIT = 12
+_DEBUG_TRACE_LOG_LIMIT = 24
 
 
 def _debug_print(config: Optional[TIDEConfig], message: str) -> None:
@@ -56,6 +59,56 @@ def _config_dict(config: TIDEConfig) -> dict[str, Any]:
     data["backend"] = "wan"
     data["text_anchoring"] = "not_applicable_cross_attention_only"
     return data
+
+
+def inject_tide_wan_options(
+    transformer_options: Optional[dict[str, Any]],
+    config: TIDEConfig,
+    *,
+    timestep: Any = None,
+    source: str = "unknown",
+) -> Optional[dict[str, Any]]:
+    """Inject the WAN TIDE runtime contract into the live transformer_options.
+
+    The WAN RoPE/forward hooks run much lower than the Comfy model_function_wrapper.
+    They must therefore be able to resolve the current TIDE config from the exact
+    transformer_options dict that reaches WanModel.rope_encode/forward_orig.  This
+    helper intentionally mutates that dict in place.
+    """
+
+    if not isinstance(transformer_options, dict):
+        return transformer_options
+
+    transformer_options[_CONFIG_KEY] = config
+    transformer_options[_ENABLED_KEY] = config.should_apply_temperature() and config.temperature_strength != 0.0
+    transformer_options[_CONFIG_SOURCE_KEY] = source
+
+    tide_opts = transformer_options.get("tide", {})
+    if not isinstance(tide_opts, dict):
+        tide_opts = {}
+    if timestep is not None:
+        tide_opts["timestep"] = _safe_timestep01(timestep)
+    tide_opts["width"] = config.width
+    tide_opts["height"] = config.height
+    transformer_options["tide"] = tide_opts
+    return transformer_options
+
+
+def has_tide_wan_options(transformer_options: Optional[dict[str, Any]]) -> bool:
+    return isinstance(transformer_options, dict) and (
+        "tide_wan" in transformer_options or isinstance(transformer_options.get(_CONFIG_KEY), TIDEConfig)
+    )
+
+
+def _trace_inner(config: Optional[TIDEConfig], inner: Any, message: str) -> None:
+    if config is None or not config.debug:
+        return
+    count = int(getattr(inner, _TRACE_LOG_COUNT_KEY, 0)) if inner is not None else 0
+    if count >= _DEBUG_TRACE_LOG_LIMIT:
+        return
+    if inner is not None:
+        setattr(inner, _TRACE_LOG_COUNT_KEY, count + 1)
+    _debug_print(config, message)
 
 
 def _looks_like_wan_inner(inner: Any) -> bool:
@@ -198,6 +251,7 @@ def _ensure_wan_rope_encode_wrapped(inner: Any, fallback_config: Optional[TIDECo
     if not _looks_like_wan_inner(inner):
         return False
     if getattr(inner, "_tide_wan_rope_encode_wrapped", False):
+        inner._tide_wan_fallback_config = fallback_config
         return True
 
     original_rope_encode = inner.rope_encode
@@ -205,7 +259,15 @@ def _ensure_wan_rope_encode_wrapped(inner: Any, fallback_config: Optional[TIDECo
     def tide_wan_rope_encode(*args: Any, **kwargs: Any):
         transformer_options = kwargs.get("transformer_options", None)
         freqs = original_rope_encode(*args, **kwargs)
-        config = _resolve_config(transformer_options, fallback_config)
+        config = _resolve_config(transformer_options, getattr(inner, "_tide_wan_fallback_config", fallback_config))
+        _trace_inner(
+            config,
+            inner,
+            "[ComfyUI-TIDE] WAN rope_encode hook entered: "
+            f"freqs_tensor={torch.is_tensor(freqs)} "
+            f"freqs_shape={tuple(freqs.shape) if torch.is_tensor(freqs) else None} "
+            f"config_source={transformer_options.get(_CONFIG_SOURCE_KEY) if isinstance(transformer_options, dict) else None}",
+        )
         if config is None:
             return freqs
         timestep = _resolve_timestep(transformer_options)
@@ -214,6 +276,7 @@ def _ensure_wan_rope_encode_wrapped(inner: Any, fallback_config: Optional[TIDECo
         return out
 
     inner._tide_wan_original_rope_encode = original_rope_encode
+    inner._tide_wan_fallback_config = fallback_config
     inner.rope_encode = tide_wan_rope_encode
     inner._tide_wan_rope_encode_wrapped = True
     _debug_print(fallback_config, f"[ComfyUI-TIDE] WAN wrapped rope_encode on {type(inner).__name__} id={id(inner)}")
@@ -224,6 +287,7 @@ def _ensure_wan_forward_orig_wrapped(inner: Any, fallback_config: Optional[TIDEC
     if not _looks_like_wan_inner(inner):
         return False
     if getattr(inner, "_tide_wan_forward_orig_wrapped", False):
+        inner._tide_wan_fallback_config = fallback_config
         return True
 
     original_forward_orig = inner.forward_orig
@@ -237,8 +301,18 @@ def _ensure_wan_forward_orig_wrapped(inner: Any, fallback_config: Optional[TIDEC
         transformer_options=None,
         **kwargs,
     ):
-        config = _resolve_config(transformer_options, fallback_config)
-        if config is not None and torch.is_tensor(freqs) and not _freqs_already_scaled(transformer_options, freqs):
+        config = _resolve_config(transformer_options, getattr(inner, "_tide_wan_fallback_config", fallback_config))
+        already_scaled = _freqs_already_scaled(transformer_options, freqs)
+        _trace_inner(
+            config,
+            inner,
+            "[ComfyUI-TIDE] WAN forward_orig hook entered: "
+            f"freqs_tensor={torch.is_tensor(freqs)} "
+            f"freqs_shape={tuple(freqs.shape) if torch.is_tensor(freqs) else None} "
+            f"already_scaled={bool(already_scaled)} "
+            f"config_source={transformer_options.get(_CONFIG_SOURCE_KEY) if isinstance(transformer_options, dict) else None}",
+        )
+        if config is not None and torch.is_tensor(freqs) and not already_scaled:
             timestep = _resolve_timestep(transformer_options, t)
             freqs = _scale_wan_freqs(config, inner, freqs, timestep=timestep)
             _mark_scaled_freqs(transformer_options, freqs)
@@ -256,21 +330,18 @@ def _ensure_wan_forward_orig_wrapped(inner: Any, fallback_config: Optional[TIDEC
         )
 
     inner._tide_wan_original_forward_orig = original_forward_orig
+    inner._tide_wan_fallback_config = fallback_config
     inner.forward_orig = tide_wan_forward_orig
     inner._tide_wan_forward_orig_wrapped = True
     _debug_print(fallback_config, f"[ComfyUI-TIDE] WAN wrapped forward_orig on {type(inner).__name__} id={id(inner)}")
     return True
 
 
-def _resolve_apply_model_wan_inner(apply_model: Any) -> Any:
-    outer = getattr(apply_model, "__self__", None)
+def _wan_candidates_from_outer(outer: Any) -> list[Any]:
     if outer is None:
-        return None
+        return []
 
-    candidates = [
-        getattr(outer, "diffusion_model", None),
-    ]
-
+    candidates = [getattr(outer, "diffusion_model", None)]
     model = getattr(outer, "model", None)
     if model is not None:
         candidates.extend(
@@ -279,8 +350,41 @@ def _resolve_apply_model_wan_inner(apply_model: Any) -> Any:
                 getattr(getattr(model, "model", None), "diffusion_model", None),
             ]
         )
+    return candidates
 
-    for candidate in candidates:
+
+def _resolve_apply_model_outer(apply_model: Any) -> Any:
+    outer = getattr(apply_model, "__self__", None)
+    if outer is not None:
+        return outer
+
+    # Spectrum WAN replaces BaseModel.apply_model with a per-instance closure.
+    # Functions assigned to an instance are not descriptors, so __self__ is lost.
+    # Recover the captured BaseModel/outer object from the closure instead of
+    # silently skipping the WAN prepare path.
+    closure = getattr(apply_model, "__closure__", None)
+    if not closure:
+        return None
+
+    matches: list[tuple[Any, Any]] = []
+    for cell in closure:
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        bound_self = getattr(value, "__self__", None)
+        if bound_self is not None:
+            value = bound_self
+        for candidate in _wan_candidates_from_outer(value):
+            if _looks_like_wan_inner(candidate) and not any(candidate is seen for _, seen in matches):
+                matches.append((value, candidate))
+    if len(matches) == 1:
+        return matches[0][0]
+    return None
+
+
+def _resolve_apply_model_wan_inner(outer: Any) -> Any:
+    for candidate in _wan_candidates_from_outer(outer):
         if _looks_like_wan_inner(candidate):
             return candidate
     return None
@@ -308,16 +412,7 @@ class TIDEWanDiffusionWrapper:
     ):
         if transformer_options is None:
             transformer_options = {}
-        transformer_options[_CONFIG_KEY] = self.config
-        transformer_options[_ENABLED_KEY] = self.config.should_apply_temperature() and self.config.temperature_strength != 0.0
-
-        tide_opts = transformer_options.get("tide", {})
-        if not isinstance(tide_opts, dict):
-            tide_opts = {}
-        tide_opts["timestep"] = _safe_timestep01(timestep)
-        tide_opts["width"] = self.config.width
-        tide_opts["height"] = self.config.height
-        transformer_options["tide"] = tide_opts
+        inject_tide_wan_options(transformer_options, self.config, timestep=timestep, source="diffusion_wrapper")
 
         inner = getattr(executor, "class_obj", None)
         wrapped_rope = _ensure_wan_rope_encode_wrapped(inner, self.config)
@@ -366,13 +461,12 @@ def prepare_tide_wan_apply_model(
     if transformer_options is None:
         return
 
-    outer = getattr(apply_model, "__self__", None)
-    inner = _resolve_apply_model_wan_inner(apply_model)
+    outer = _resolve_apply_model_outer(apply_model)
+    inner = _resolve_apply_model_wan_inner(outer)
     if not _looks_like_wan_inner(inner):
         return
 
-    transformer_options[_CONFIG_KEY] = config
-    transformer_options[_ENABLED_KEY] = config.should_apply_temperature() and config.temperature_strength != 0.0
+    inject_tide_wan_options(transformer_options, config, source="model_function_wrapper")
 
     wrapped_rope = _ensure_wan_rope_encode_wrapped(inner, config)
     wrapped_forward_orig = _ensure_wan_forward_orig_wrapped(inner, config)
@@ -398,8 +492,7 @@ def install_tide_wan_patch(model: Any, config: TIDEConfig) -> Any:
     """Install the WAN-specific TIDE DTC path on a cloned ComfyUI MODEL."""
 
     transformer_options = _ensure_transformer_options(model)
-    transformer_options[_CONFIG_KEY] = config
-    transformer_options[_ENABLED_KEY] = config.should_apply_temperature() and config.temperature_strength != 0.0
+    inject_tide_wan_options(transformer_options, config, source="node_install")
     transformer_options["tide_wan"] = _config_dict(config)
 
     wrapper = TIDEWanDiffusionWrapper(config)
@@ -438,7 +531,9 @@ def install_tide_wan_patch(model: Any, config: TIDEConfig) -> Any:
 
 __all__ = [
     "TIDEWanDiffusionWrapper",
+    "has_tide_wan_options",
     "install_tide_wan_patch",
     "prepare_tide_wan_apply_model",
+    "inject_tide_wan_options",
     "_scale_wan_freqs",
 ]
