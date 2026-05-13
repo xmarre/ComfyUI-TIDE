@@ -383,8 +383,7 @@ def _resolve_apply_model_outer(apply_model: Any) -> Any:
     return None
 
 
-def _resolve_apply_model_wan_inner(apply_model: Any) -> Any:
-    outer = _resolve_apply_model_outer(apply_model)
+def _resolve_apply_model_wan_inner(outer: Any) -> Any:
     for candidate in _wan_candidates_from_outer(outer):
         if _looks_like_wan_inner(candidate):
             return candidate
@@ -463,7 +462,7 @@ def prepare_tide_wan_apply_model(
         return
 
     outer = _resolve_apply_model_outer(apply_model)
-    inner = _resolve_apply_model_wan_inner(apply_model)
+    inner = _resolve_apply_model_wan_inner(outer)
     if not _looks_like_wan_inner(inner):
         return
 
