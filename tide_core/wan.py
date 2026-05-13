@@ -23,6 +23,7 @@ _BLOCK_PATCH_KEY = "_tide_wan_block_dtc_patch"
 _BLOCK_PATCH_CONFIG_KEY = "_tide_wan_block_dtc_config"
 _BLOCK_PATCH_INNER_KEY = "_tide_wan_block_dtc_inner"
 _BLOCK_PATCH_SOURCE_KEY = "_tide_wan_block_dtc_source"
+_BLOCK_PATCH_TRANSFORMER_OPTIONS_KEY = "_tide_wan_block_dtc_transformer_options"
 _BLOCK_SCALED_CACHE_KEY = "_tide_wan_block_scaled_freqs_cache"
 _TRACE_LOG_COUNT_KEY = "_tide_wan_trace_log_count"
 _DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
@@ -410,18 +411,19 @@ def _get_block_scaled_freqs(
         return freqs
 
     cache = None
+    timestep = _resolve_timestep(transformer_options)
+    cache_key = (id(freqs), timestep, id(config))
     if isinstance(transformer_options, dict):
         cache = transformer_options.setdefault(_BLOCK_SCALED_CACHE_KEY, {})
         if isinstance(cache, dict):
-            cached = cache.get(id(freqs))
+            cached = cache.get(cache_key)
             if torch.is_tensor(cached):
                 return cached
 
-    timestep = _resolve_timestep(transformer_options)
     out = _scale_wan_freqs(config, inner, freqs, timestep=timestep)
     _mark_scaled_freqs(transformer_options, out)
     if isinstance(cache, dict) and torch.is_tensor(out):
-        cache[id(freqs)] = out
+        cache[cache_key] = out
     return out
 
 
@@ -460,11 +462,16 @@ def _install_wan_block_dtc_patches(
         def tide_wan_block_patch(args, extra_options):
             local_config = getattr(tide_wan_block_patch, _BLOCK_PATCH_CONFIG_KEY, config)
             local_inner = getattr(tide_wan_block_patch, _BLOCK_PATCH_INNER_KEY, inner)
+            fallback_transformer_options = getattr(
+                tide_wan_block_patch,
+                _BLOCK_PATCH_TRANSFORMER_OPTIONS_KEY,
+                transformer_options,
+            )
             block_transformer_options = None
             if isinstance(args, dict):
                 block_transformer_options = args.get("transformer_options")
             if not isinstance(block_transformer_options, dict):
-                block_transformer_options = transformer_options
+                block_transformer_options = fallback_transformer_options
 
             resolved_config = _resolve_config(block_transformer_options, local_config)
             if resolved_config is not None and isinstance(args, dict) and "pe" in args:
@@ -502,6 +509,7 @@ def _install_wan_block_dtc_patches(
             setattr(previous_patch, _BLOCK_PATCH_CONFIG_KEY, config)
             setattr(previous_patch, _BLOCK_PATCH_INNER_KEY, inner)
             setattr(previous_patch, _BLOCK_PATCH_SOURCE_KEY, source)
+            setattr(previous_patch, _BLOCK_PATCH_TRANSFORMER_OPTIONS_KEY, transformer_options)
             installed += 1
             continue
 
@@ -510,6 +518,7 @@ def _install_wan_block_dtc_patches(
         setattr(tide_wan_block_patch, _BLOCK_PATCH_CONFIG_KEY, config)
         setattr(tide_wan_block_patch, _BLOCK_PATCH_INNER_KEY, inner)
         setattr(tide_wan_block_patch, _BLOCK_PATCH_SOURCE_KEY, source)
+        setattr(tide_wan_block_patch, _BLOCK_PATCH_TRANSFORMER_OPTIONS_KEY, transformer_options)
         dit_replace[block_key] = tide_wan_block_patch
         installed += 1
 
