@@ -246,7 +246,7 @@ class TIDEModelWrapper:
 
             if has_tide_wan_options(transformer_options):
                 inject_tide_wan_options(transformer_options, self.config, timestep=args.get("timestep"), source="model_function_wrapper")
-        except Exception as exc:
+        except (ImportError, AttributeError, KeyError, TypeError, ValueError) as exc:
             if not getattr(self, "_wan_injection_warned", False):
                 _LOG.warning("TIDE WAN transformer_options injection failed and was skipped: %s", exc, exc_info=True)
                 self._wan_injection_warned = True
