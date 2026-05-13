@@ -18,6 +18,12 @@ _ENABLED_KEY = "tide_wan_enabled"
 _WRAPPER_KEY = "tide_wan_rope_temperature"
 _SCALED_FREQS_ID_KEY = "_tide_wan_scaled_freqs_id"
 _CONFIG_SOURCE_KEY = "_tide_wan_config_source"
+_INNER_KEY = "_tide_wan_inner"
+_BLOCK_PATCH_KEY = "_tide_wan_block_dtc_patch"
+_BLOCK_PATCH_CONFIG_KEY = "_tide_wan_block_dtc_config"
+_BLOCK_PATCH_INNER_KEY = "_tide_wan_block_dtc_inner"
+_BLOCK_PATCH_SOURCE_KEY = "_tide_wan_block_dtc_source"
+_BLOCK_SCALED_CACHE_KEY = "_tide_wan_block_scaled_freqs_cache"
 _TRACE_LOG_COUNT_KEY = "_tide_wan_trace_log_count"
 _DIFFUSION_MODEL_WRAPPER_TYPE = "diffusion_model"
 _DEBUG_SCALE_LOG_LIMIT = 12
@@ -202,9 +208,10 @@ def _scale_wan_freqs(
     out = freqs * scale.reshape(view_shape)
 
     if config.debug:
-        count = int(getattr(inner, "_tide_wan_scale_log_count", 0))
+        count = int(getattr(inner, "_tide_wan_scale_log_count", 0)) if inner is not None else 0
         if count < _DEBUG_SCALE_LOG_LIMIT:
-            setattr(inner, "_tide_wan_scale_log_count", count + 1)
+            if inner is not None:
+                setattr(inner, "_tide_wan_scale_log_count", count + 1)
             _debug_print(
                 config,
                 "[ComfyUI-TIDE] WAN DTC applied: "
@@ -390,6 +397,137 @@ def _resolve_apply_model_wan_inner(outer: Any) -> Any:
     return None
 
 
+
+def _get_block_scaled_freqs(
+    transformer_options: Optional[dict[str, Any]],
+    config: TIDEConfig,
+    inner: Any,
+    freqs: Any,
+) -> Any:
+    if not torch.is_tensor(freqs):
+        return freqs
+    if _freqs_already_scaled(transformer_options, freqs):
+        return freqs
+
+    cache = None
+    if isinstance(transformer_options, dict):
+        cache = transformer_options.setdefault(_BLOCK_SCALED_CACHE_KEY, {})
+        if isinstance(cache, dict):
+            cached = cache.get(id(freqs))
+            if torch.is_tensor(cached):
+                return cached
+
+    timestep = _resolve_timestep(transformer_options)
+    out = _scale_wan_freqs(config, inner, freqs, timestep=timestep)
+    _mark_scaled_freqs(transformer_options, out)
+    if isinstance(cache, dict) and torch.is_tensor(out):
+        cache[id(freqs)] = out
+    return out
+
+
+def _install_wan_block_dtc_patches(
+    transformer_options: Optional[dict[str, Any]],
+    config: TIDEConfig,
+    inner: Any,
+    *,
+    source: str,
+) -> bool:
+    """Install a block-level WAN PE scaling fallback.
+
+    Spectrum WAN 2.1 can run actual forwards through an APPLY_MODEL driver where
+    neither the native WanModel.rope_encode hook nor the WanModel.forward_orig
+    hook is reached by TIDE, even though transformer block execution still goes
+    through Comfy's patches_replace path.  Wrapping the block replacement hooks
+    lets TIDE scale the shared RoPE matrix at the last stable point before each
+    attention block while preserving existing DiffAid/Spectrum patches.
+    """
+
+    if not isinstance(transformer_options, dict) or not _looks_like_wan_inner(inner):
+        return False
+
+    patches_replace = transformer_options.get("patches_replace")
+    if not isinstance(patches_replace, dict):
+        patches_replace = {}
+    dit_replace = patches_replace.get("dit")
+    if not isinstance(dit_replace, dict):
+        dit_replace = {}
+
+    block_count = len(getattr(inner, "blocks", ()) or ())
+    if block_count <= 0:
+        return False
+
+    def make_tide_wan_block_patch(previous_patch: Any, block_index: int):
+        def tide_wan_block_patch(args, extra_options):
+            local_config = getattr(tide_wan_block_patch, _BLOCK_PATCH_CONFIG_KEY, config)
+            local_inner = getattr(tide_wan_block_patch, _BLOCK_PATCH_INNER_KEY, inner)
+            block_transformer_options = None
+            if isinstance(args, dict):
+                block_transformer_options = args.get("transformer_options")
+            if not isinstance(block_transformer_options, dict):
+                block_transformer_options = transformer_options
+
+            resolved_config = _resolve_config(block_transformer_options, local_config)
+            if resolved_config is not None and isinstance(args, dict) and "pe" in args:
+                if isinstance(block_transformer_options, dict):
+                    block_transformer_options[_INNER_KEY] = local_inner
+                pe = args.get("pe")
+                scaled_pe = _get_block_scaled_freqs(block_transformer_options, resolved_config, local_inner, pe)
+                if scaled_pe is not pe:
+                    args = dict(args)
+                    args["pe"] = scaled_pe
+                    if resolved_config.debug and not getattr(tide_wan_block_patch, "_tide_wan_block_scaled_logged", False):
+                        setattr(tide_wan_block_patch, "_tide_wan_block_scaled_logged", True)
+                        _debug_print(
+                            resolved_config,
+                            "[ComfyUI-TIDE] WAN block DTC fallback scaled PE: "
+                            f"block={block_index} source={getattr(tide_wan_block_patch, _BLOCK_PATCH_SOURCE_KEY, source)} "
+                            f"pe_shape={tuple(pe.shape) if torch.is_tensor(pe) else None}",
+                        )
+
+            if callable(previous_patch):
+                return previous_patch(args, extra_options)
+            original_block = extra_options.get("original_block") if isinstance(extra_options, dict) else None
+            if not callable(original_block):
+                raise RuntimeError("TIDE WAN block DTC patch missing original_block")
+            return original_block(args)
+
+        return tide_wan_block_patch
+
+    installed = 0
+    for block_index in range(block_count):
+        block_key = ("double_block", block_index)
+        previous_patch = dit_replace.get(block_key)
+
+        if callable(previous_patch) and getattr(previous_patch, _BLOCK_PATCH_KEY, False):
+            setattr(previous_patch, _BLOCK_PATCH_CONFIG_KEY, config)
+            setattr(previous_patch, _BLOCK_PATCH_INNER_KEY, inner)
+            setattr(previous_patch, _BLOCK_PATCH_SOURCE_KEY, source)
+            installed += 1
+            continue
+
+        tide_wan_block_patch = make_tide_wan_block_patch(previous_patch, block_index)
+        setattr(tide_wan_block_patch, _BLOCK_PATCH_KEY, True)
+        setattr(tide_wan_block_patch, _BLOCK_PATCH_CONFIG_KEY, config)
+        setattr(tide_wan_block_patch, _BLOCK_PATCH_INNER_KEY, inner)
+        setattr(tide_wan_block_patch, _BLOCK_PATCH_SOURCE_KEY, source)
+        dit_replace[block_key] = tide_wan_block_patch
+        installed += 1
+
+    patches_replace["dit"] = dit_replace
+    transformer_options["patches_replace"] = patches_replace
+
+    if config.debug:
+        marker = "_tide_wan_block_dtc_logged"
+        if not getattr(inner, marker, False):
+            setattr(inner, marker, True)
+            _debug_print(
+                config,
+                "[ComfyUI-TIDE] WAN block DTC fallback installed: "
+                f"blocks={installed}/{block_count} source={source}",
+            )
+    return installed > 0
+
+
 class TIDEWanDiffusionWrapper:
     """ComfyUI diffusion_model wrapper that enables WAN RoPE DTC hooks lazily."""
 
@@ -415,8 +553,11 @@ class TIDEWanDiffusionWrapper:
         inject_tide_wan_options(transformer_options, self.config, timestep=timestep, source="diffusion_wrapper")
 
         inner = getattr(executor, "class_obj", None)
+        if isinstance(transformer_options, dict):
+            transformer_options[_INNER_KEY] = inner
         wrapped_rope = _ensure_wan_rope_encode_wrapped(inner, self.config)
         wrapped_forward_orig = _ensure_wan_forward_orig_wrapped(inner, self.config)
+        installed_block_dtc = _install_wan_block_dtc_patches(transformer_options, self.config, inner, source="diffusion_wrapper")
         if self.config.debug:
             if not getattr(self, "_logged_runtime", False):
                 _debug_print(
@@ -424,6 +565,7 @@ class TIDEWanDiffusionWrapper:
                     "[ComfyUI-TIDE] WAN diffusion wrapper active: "
                     f"inner={type(inner).__name__ if inner is not None else None} "
                     f"wrapped_rope={bool(wrapped_rope)} wrapped_forward_orig={bool(wrapped_forward_orig)} "
+                    f"block_dtc={bool(installed_block_dtc)} "
                     f"enabled={bool(transformer_options[_ENABLED_KEY])}",
                 )
                 self._logged_runtime = True
@@ -467,9 +609,11 @@ def prepare_tide_wan_apply_model(
         return
 
     inject_tide_wan_options(transformer_options, config, source="model_function_wrapper")
+    transformer_options[_INNER_KEY] = inner
 
     wrapped_rope = _ensure_wan_rope_encode_wrapped(inner, config)
     wrapped_forward_orig = _ensure_wan_forward_orig_wrapped(inner, config)
+    installed_block_dtc = _install_wan_block_dtc_patches(transformer_options, config, inner, source="model_function_wrapper")
 
     if config.debug:
         # Log once per live inner. This is intentionally separate from
@@ -484,6 +628,7 @@ def prepare_tide_wan_apply_model(
                 f"outer={type(outer).__name__ if outer is not None else None} "
                 f"inner={type(inner).__name__ if inner is not None else None} "
                 f"wrapped_rope={bool(wrapped_rope)} wrapped_forward_orig={bool(wrapped_forward_orig)} "
+                f"block_dtc={bool(installed_block_dtc)} "
                 f"enabled={bool(transformer_options[_ENABLED_KEY])}",
             )
 
