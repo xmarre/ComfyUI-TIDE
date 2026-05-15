@@ -3,15 +3,15 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from .tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper, install_tide_wan_patch
+    from .tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper, aspect_adaptive_base_resolution, install_tide_wan_patch
 except ModuleNotFoundError as exc:
     if exc.name not in {f"{__package__}.tide_core", "tide_core"}:
         raise
-    from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper, install_tide_wan_patch
+    from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper, aspect_adaptive_base_resolution, install_tide_wan_patch
 except ImportError as exc:
     if "attempted relative import with no known parent package" not in str(exc):
         raise
-    from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper, install_tide_wan_patch
+    from tide_core import TIDEConfig, TIDEAttentionOverride, TIDEAttentionPatch, TIDEModelWrapper, aspect_adaptive_base_resolution, install_tide_wan_patch
 
 
 class TIDEHighResolutionExtrapolation:
@@ -110,6 +110,24 @@ class TIDEHighResolutionExtrapolation:
         return (patched,)
 
 
+def _resolve_wan_base_resolution(
+    *,
+    width: int,
+    height: int,
+    base_width: int,
+    base_height: int,
+    base_resolution_mode: str,
+) -> tuple[int, int]:
+    mode = str(base_resolution_mode)
+    if mode == "manual":
+        return int(base_width), int(base_height)
+    if mode == "aspect_adaptive_720p":
+        return aspect_adaptive_base_resolution(width, height, 1280, 720)
+    if mode == "aspect_adaptive_480p":
+        return aspect_adaptive_base_resolution(width, height, 832, 480)
+    raise ValueError(f"Unsupported WAN base_resolution_mode: {base_resolution_mode!r}")
+
+
 class TIDEWANHighResolutionExtrapolation:
     """Patch a WAN 2.1/2.2-style DiT model with TIDE Dynamic Temperature Control."""
 
@@ -126,8 +144,12 @@ class TIDEWANHighResolutionExtrapolation:
                 ),
             },
             "optional": {
-                "base_width": ("INT", {"default": 640, "min": 16, "max": 16384, "step": 16}),
-                "base_height": ("INT", {"default": 640, "min": 16, "max": 16384, "step": 16}),
+                "base_resolution_mode": (
+                    ["aspect_adaptive_720p", "aspect_adaptive_480p", "manual"],
+                    {"default": "aspect_adaptive_720p", "tooltip": "WAN native reference. Adaptive modes preserve target aspect and keep a 1280x720 or 832x480 native pixel budget; manual uses base_width/base_height exactly."},
+                ),
+                "base_width": ("INT", {"default": 1280, "min": 16, "max": 16384, "step": 16}),
+                "base_height": ("INT", {"default": 720, "min": 16, "max": 16384, "step": 16}),
                 "alpha_low": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 8.0, "step": 0.05}),
                 "alpha_high": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 8.0, "step": 0.05}),
                 "tau_max": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 4.0, "step": 0.01}),
@@ -149,8 +171,9 @@ class TIDEWANHighResolutionExtrapolation:
         width: int,
         height: int,
         temperature_strength: float,
-        base_width: int = 640,
-        base_height: int = 640,
+        base_resolution_mode: str = "aspect_adaptive_720p",
+        base_width: int = 1280,
+        base_height: int = 720,
         alpha_low: float = 0.6,
         alpha_high: float = 0.2,
         tau_max: float = 1.0,
@@ -159,6 +182,14 @@ class TIDEWANHighResolutionExtrapolation:
         preserve_existing_wrapper: bool = True,
         debug: bool = False,
     ):
+        base_width, base_height = _resolve_wan_base_resolution(
+            width=int(width),
+            height=int(height),
+            base_width=int(base_width),
+            base_height=int(base_height),
+            base_resolution_mode=str(base_resolution_mode),
+        )
+
         config = TIDEConfig(
             width=int(width),
             height=int(height),
