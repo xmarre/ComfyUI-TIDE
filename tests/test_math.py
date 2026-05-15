@@ -2,6 +2,7 @@ import math
 import pathlib
 import sys
 
+import pytest
 import torch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -67,3 +68,8 @@ def test_aspect_adaptive_base_resolution_preserves_wan_480p_budget():
     assert aspect_adaptive_base_resolution(832, 480, 832, 480) == (832, 480)
     base_width, base_height = aspect_adaptive_base_resolution(480, 832, 832, 480)
     assert base_width * base_height <= 832 * 480
+
+
+def test_aspect_adaptive_base_resolution_rejects_unsnappable_budget():
+    with pytest.raises(ValueError, match="No grid-aligned base resolution"):
+        aspect_adaptive_base_resolution(100_000_000, 1, 1280, 720)

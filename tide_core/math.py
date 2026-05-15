@@ -76,8 +76,12 @@ def aspect_adaptive_base_resolution(
         for candidate in candidates
         if candidate[0] * candidate[1] <= native_width * native_height
     ]
-    if under_budget:
-        candidates = set(under_budget)
+    if not under_budget:
+        raise ValueError(
+            "No grid-aligned base resolution satisfies the native area budget "
+            f"for {width}x{height} against {native_width}x{native_height} on grid {grid}"
+        )
+    candidates = set(under_budget)
 
     def score(candidate: tuple[int, int]) -> tuple[float, float]:
         candidate_width, candidate_height = candidate
