@@ -1,7 +1,7 @@
 [project]
 name = "tide"
 description = "A ComfyUI custom node implementing TIDE (Text-Informed Dynamic Extrapolation with Step-Aware Temperature Control) for diffusion models."
-version = "1.0.1"
+version = "1.0.2"
 license = { file = "LICENSE" }
 
 [project.urls]
