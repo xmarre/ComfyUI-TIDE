@@ -26,6 +26,72 @@ def get_default_temperature(scale: float) -> float:
     return 1.0 / (mscale * mscale)
 
 
+def aspect_adaptive_base_resolution(
+    width: int,
+    height: int,
+    native_width: int,
+    native_height: int,
+    *,
+    grid: int = 16,
+) -> tuple[int, int]:
+    """Return native-budget base dimensions matched to the target aspect.
+
+    WAN 480p/720p checkpoints are better represented as a native pixel budget
+    than as one fixed landscape rectangle.  For an arbitrary I2V aspect, preserve
+    the target aspect while keeping native_width * native_height as the maximum
+    native reference area used by TIDE's extrapolation gates and RoPE-axis scale
+    factors.
+    """
+
+    width = int(width)
+    height = int(height)
+    native_width = int(native_width)
+    native_height = int(native_height)
+    grid = int(grid)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"width and height must be > 0, got {width}x{height}")
+    if native_width <= 0 or native_height <= 0:
+        raise ValueError(f"native base must be > 0, got {native_width}x{native_height}")
+    if grid <= 0:
+        raise ValueError(f"grid must be > 0, got {grid}")
+
+    native_area = float(native_width) * float(native_height)
+    aspect = float(width) / float(height)
+    raw_width = math.sqrt(native_area * aspect)
+    raw_height = math.sqrt(native_area / aspect)
+
+    def snapped_neighbors(value: float) -> tuple[int, int]:
+        scaled = value / grid
+        lower = max(grid, int(math.floor(scaled)) * grid)
+        upper = max(grid, int(math.ceil(scaled)) * grid)
+        return lower, upper
+
+    candidates = {
+        (candidate_width, candidate_height)
+        for candidate_width in snapped_neighbors(raw_width)
+        for candidate_height in snapped_neighbors(raw_height)
+    }
+    under_budget = [
+        candidate
+        for candidate in candidates
+        if candidate[0] * candidate[1] <= native_width * native_height
+    ]
+    if not under_budget:
+        raise ValueError(
+            "No grid-aligned base resolution satisfies the native area budget "
+            f"for {width}x{height} against {native_width}x{native_height} on grid {grid}"
+        )
+    candidates = set(under_budget)
+
+    def score(candidate: tuple[int, int]) -> tuple[float, float]:
+        candidate_width, candidate_height = candidate
+        area_error = abs((candidate_width * candidate_height) - native_area) / native_area
+        aspect_error = abs((candidate_width / candidate_height) - aspect) / aspect
+        return area_error, aspect_error
+
+    return min(candidates, key=score)
+
+
 def adaptive_text_bias(config: TIDEConfig) -> float:
     """Paper Eq. 17/18: beta = log(lambda), with lambda = pixel ratio.
 
